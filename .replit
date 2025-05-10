@@ -1,142 +1,15 @@
-from flask import Flask, request
-import datetime
-import re
-import pickle
-import sys
-from googleapiclient.discovery import build
+entrypoint = "main.py"
+modules = ["python-3.11"]
 
-app = Flask(__name__)
+[nix]
+channel = "stable-24_05"
 
-# === Your Custom Gig Parsing Function ===
-def parse_gig_message(body):
-    data = {
-        'date': '',
-        'location': '',
-        'time': '',
-        'description': '',
-        'show_length': '',
-        'sound_and_lighting': '',
-        'confirmation': '',
-        'title': 'הופעה סטטיק'
-    }
+[unitTest]
+language = "python3"
 
-    lines = body.strip().split('\n')
-    found_date = False
-    location_assigned = False
+[gitHubImport]
+requiredFiles = [".replit", "replit.nix"]
 
-    for line in lines:
-        line = line.strip()
-
-        if not data['date']:
-            match = re.match(r'\d{1,2}\.\d{1,2}\.\d{2,4}', line)
-            if match:
-                data['date'] = match.group()
-                found_date = True
-                continue
-
-        if found_date and not location_assigned:
-            if not re.search(r'\d{1,2}:\d{2}', line) and not line.startswith('שעת עלייה') and not any(
-                keyword in line for keyword in ['מופע', 'דקות', 'הגברה', 'תאורה', 'נא לאשר', 'אירוע']):
-                data['location'] = line
-                location_assigned = True
-                continue
-
-        if line.startswith('שעת עלייה'):
-            match = re.search(r'\d{1,2}:\d{2}', line)
-            if match:
-                data['time'] = match.group()
-                continue
-
-        if 'מופע' in line or 'דקות' in line:
-            data['show_length'] = line.strip()
-            continue
-
-        if 'הגברה' in line or 'תאורה' in line:
-            data['sound_and_lighting'] = line.strip()
-            continue
-
-        if 'נא לאשר' in line:
-            data['confirmation'] = line.strip()
-            continue
-
-        if not data['description'] and data['location']:
-            data['description'] = line
-
-    return data
-
-# === Google Calendar Integration ===
-def create_calendar_event(parsed):
-    try:
-        with open('token.pickle', 'rb') as token:
-            creds = pickle.load(token)
-
-        service = build('calendar', 'v3', credentials=creds)
-
-        # Convert date + time
-        date_parts = parsed['date'].split('.')
-        date_str = f"{date_parts[2]}-{date_parts[1]}-{date_parts[0]}"
-        datetime_start = datetime.datetime.strptime(f"{date_str} {parsed['time']}", "%Y-%m-%d %H:%M")
-
-        # Duration guess
-        if 'שעתיים' in parsed['show_length']:
-            duration_hours = 2
-        elif '45' in parsed['show_length']:
-            duration_hours = 0.75
-        else:
-            duration_hours = 1
-
-        datetime_end = datetime_start + datetime.timedelta(hours=duration_hours)
-
-        event = {
-            'summary': parsed['title'],
-            'location': parsed['location'],
-            'description': f"{parsed['description']}\n{parsed['sound_and_lighting']}\n{parsed['confirmation']}",
-            'start': {
-                'dateTime': datetime_start.isoformat(),
-                'timeZone': 'Asia/Jerusalem',
-            },
-            'end': {
-                'dateTime': datetime_end.isoformat(),
-                'timeZone': 'Asia/Jerusalem',
-            },
-        }
-
-        created = service.events().insert(calendarId='primary', body=event).execute()
-        print("✅ Calendar event created:", created.get('htmlLink'))
-        sys.stdout.flush()
-
-    except Exception as e:
-        print("❌ Calendar error:", e)
-        sys.stdout.flush()
-
-# === Webhook Endpoint ===
-@app.route("/", methods=["POST"])
-def handle_whatsapp():
-    try:
-        print("🚨 Webhook hit!")
-        sys.stdout.flush()
-
-        body = (
-            request.form.get("Body")
-            or request.get_json(silent=True).get("Body")
-            if request.get_json(silent=True)
-            else ''
-        )
-
-        print("📩 Raw message:", repr(body))
-        parsed = parse_gig_message(body)
-        print("🧠 Parsed gig data:", parsed)
-        sys.stdout.flush()
-
-        create_calendar_event(parsed)
-        return "OK", 200
-
-    except Exception as e:
-        print("❌ ERROR:", str(e))
-        sys.stdout.flush()
-        return "ERROR", 500
-
-if __name__ == "__main__":
-    print("🔥 Flask app is running")
-    sys.stdout.flush()
-    app.run(host="0.0.0.0", port=3000)
+[deployment]
+run = ["python3", "main.py"]
+deploymentTarget = "cloudrun"
