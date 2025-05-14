@@ -7,7 +7,17 @@ from googleapiclient.discovery import build
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import openai
+import json
+import base64
 import os
+
+# Load credentials.json from secret
+creds_json = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+
+# Load token.pickle from base64-encoded string
+token_pickle = base64.b64decode(os.environ["GOOGLE_OAUTH_TOKEN_PICKLE"])
+with open("token.pickle", "wb") as f:
+    f.write(token_pickle)
 
 import os
 
