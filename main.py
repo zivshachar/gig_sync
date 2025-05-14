@@ -1,0 +1,243 @@
+from flask import Flask, request
+import datetime
+import re
+import pickle
+import sys
+from googleapiclient.discovery import build
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import openai
+import os
+
+openai.api_key = "REMOVED\nAIza==>REMOVED\nya29.==>REMOVEDR3v5TL81tbzBgTnSkPPSjSxJuR_QNYBMG7bk6tIG_-T3BlbkFJd4k3m25WeLPeK4y4DA2A7m8BkinR7YlkzlHSikRZIA"  # 👈 your real key goes here
+
+app = Flask(__name__)
+
+
+# === Gig parser ===
+def parse_with_gpt(body):
+    try:
+        system_prompt = """
+You are a helpful assistant. Extract gig details from messages into structured JSON.
+Only return JSON. Here is the format:
+
+{
+  "date": "DD.MM.YYYY",
+  "time": "HH:MM",
+  "location": "string",
+  "description": "string",
+  "show_length": "string",
+  "sound_and_lighting": "string",
+  "confirmation": "string",
+  "title": "string (default: הופעה סטטיק)"
+}
+"""
+
+        messages = [
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": body.strip()}
+        ]
+
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=messages
+        )
+
+        raw_text = response["choices"][0]["message"]["content"]
+        print("🧠 GPT raw:", raw_text)
+        parsed = eval(raw_text)  # quick + dirty for now — we'll tighten it later
+        return parsed
+
+    except Exception as e:
+        print("❌ GPT parse failed:", e)
+        return {
+            'date': '',
+            'location': '',
+            'time': '',
+            'description': '',
+            'show_length': '',
+            'sound_and_lighting': '',
+            'confirmation': '',
+            'title': 'הופעה סטטיק'
+        }
+
+
+def parse_gig_message(body):
+    data = {
+        'date': '',
+        'location': '',
+        'time': '',
+        'description': '',
+        'show_length': '',
+        'sound_and_lighting': '',
+        'confirmation': '',
+        'title': 'הופעה סטטיק'
+    }
+
+    lines = body.strip().split('\n')
+    found_date = False
+    location_assigned = False
+
+    for line in lines:
+        line = line.strip()
+
+        if not data['date']:
+            match = re.match(r'\d{1,2}\.\d{1,2}\.\d{2,4}', line)
+            if match:
+                data['date'] = match.group()
+                found_date = True
+                continue
+
+        if found_date and not location_assigned:
+            if (not re.search(r'\d{1,2}:\d{2}', line)
+                    and not line.startswith('שעת עלייה')
+                    and not any(keyword in line for keyword in [
+                        'מופע', 'דקות', 'הגברה', 'תאורה', 'נא לאשר', 'אירוע',
+                        'בר מצווה', 'חתונה'
+                    ]) and len(line.split()) > 1  # avoid one-word junk
+                ):
+                data['location'] = line
+                location_assigned = True
+                continue
+
+        if line.startswith('שעת עלייה'):
+            match = re.search(r'\d{1,2}:\d{2}', line)
+            if match:
+                data['time'] = match.group()
+                continue
+
+        if 'מופע' in line or 'דקות' in line:
+            data['show_length'] = line.strip()
+            continue
+
+        if 'הגברה' in line or 'תאורה' in line:
+            data['sound_and_lighting'] = line.strip()
+            continue
+
+        if 'נא לאשר' in line:
+            data['confirmation'] = line.strip()
+            continue
+
+        if not data['description'] and data['location']:
+            data['description'] = line
+
+    return data
+
+
+# === Calendar event creator ===
+def create_calendar_event(parsed):
+    try:
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+
+        service = build('calendar', 'v3', credentials=creds)
+
+        date_parts = parsed['date'].split('.')
+
+        # Handle both dd.mm.yy and dd.mm.yyyy
+        day, month, year = date_parts
+        if len(year) == 2:
+            year = '20' + year  # convert 25 → 2025
+
+        date_str = f"{year}-{month}-{day}"
+        datetime_start = datetime.datetime.strptime(
+            f"{date_str} {parsed['time']}", "%Y-%m-%d %H:%M")
+
+        if 'שעתיים' in parsed['show_length']:
+            duration_hours = 2
+        elif '45' in parsed['show_length']:
+            duration_hours = 0.75
+        else:
+            duration_hours = 1
+
+        datetime_end = datetime_start + datetime.timedelta(
+            hours=duration_hours)
+
+        event = {
+            'summary': parsed['title'],
+            'location': parsed['location'],
+            'description':
+            f"{parsed['description']}\n{parsed['sound_and_lighting']}\n{parsed['confirmation']}",
+            'start': {
+                'dateTime': datetime_start.isoformat(),
+                'timeZone': 'Asia/Jerusalem',
+            },
+            'end': {
+                'dateTime': datetime_end.isoformat(),
+                'timeZone': 'Asia/Jerusalem',
+            },
+        }
+
+        result = service.events().insert(calendarId='primary',
+                                         body=event).execute()
+        print("✅ Event created:", result.get('htmlLink'))
+        sys.stdout.flush()
+
+    except Exception as e:
+        print("❌ Calendar error:", e)
+        sys.stdout.flush()
+
+
+def log_to_google_sheets(parsed):
+    try:
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(
+            "credentials.json", scope)
+        client = gspread.authorize(creds)
+
+        sheet = client.open("Gig Log").sheet1  # Assumes first sheet
+        row = [
+            parsed['date'],
+            parsed['time'],
+            parsed['location'],
+            parsed['description'],
+            parsed['show_length'],
+            parsed['sound_and_lighting'],
+            parsed['confirmation'],
+        ]
+        sheet.append_row(row)
+        print("🟢 Gig logged to Google Sheets.")
+        sys.stdout.flush()
+    except Exception as e:
+        print("❌ Google Sheets error:", e)
+        sys.stdout.flush()
+
+
+# === Webhook ===
+@app.route("/", methods=["POST"])
+def handle_whatsapp():
+    try:
+        print("🚨 Webhook hit!")
+        sys.stdout.flush()
+
+        print("📥 request.form:", dict(request.form))
+        print("📥 request.get_json():", request.get_json(silent=True))
+        print("📥 request.data:", request.data.decode())
+        sys.stdout.flush()
+
+        body = (request.form.get("Body")
+                or (request.get_json(silent=True) or {}).get("Body")
+                or request.data.decode())
+
+        print("📩 Raw message:", repr(body))
+        parsed = parse_with_gpt(body)
+        print("🧠 Parsed data:", parsed)
+        sys.stdout.flush()
+
+        create_calendar_event(parsed)
+        log_to_google_sheets(parsed)
+        return "OK", 200
+
+    except Exception as e:
+        print("❌ ERROR:", str(e))
+        sys.stdout.flush()
+        return "ERROR", 500
+
+
+if __name__ == "__main__":
+    print("🔥 Flask app is running")
+    sys.stdout.flush()
+    app.run(host="0.0.0.0", port=3000)
