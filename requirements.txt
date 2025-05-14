@@ -1,3 +1,6 @@
 flask\ngoogle-api-python-client\ngoogle-auth\ngoogle-auth-oauthlib
 flask
 google-api-python-client
+gspread
+oauth2client
+openai

@@ -9,7 +9,9 @@ from oauth2client.service_account import ServiceAccountCredentials
 import openai
 import os
 
-openai.api_key = "REMOVED\nAIza==>REMOVED\nya29.==>REMOVEDR3v5TL81tbzBgTnSkPPSjSxJuR_QNYBMG7bk6tIG_-T3BlbkFJd4k3m25WeLPeK4y4DA2A7m8BkinR7YlkzlHSikRZIA"  # 👈 your real key goes here
+import os
+
+openai.api_key = os.environ.get("OPENAI_API_KEY")
 
 app = Flask(__name__)
 
@@ -18,34 +20,90 @@ app = Flask(__name__)
 def parse_with_gpt(body):
     try:
         system_prompt = """
-You are a helpful assistant. Extract gig details from messages into structured JSON.
-Only return JSON. Here is the format:
+You are a helpful assistant that extracts gig, session, or reminder details from unstructured Hebrew messages and returns structured JSON.
+
+Your job is to interpret casual, often messy messages and output clear structured data.
+
+### Output Format:
+Always respond with only valid JSON in this structure:
 
 {
+  "type": "gig" | "session" | "reminder",
   "date": "DD.MM.YYYY",
   "time": "HH:MM",
   "location": "string",
   "description": "string",
-  "show_length": "string",
+  "show_length": "string (e.g. '45 דקות מופע' or '4 שעות')",
   "sound_and_lighting": "string",
   "confirmation": "string",
-  "title": "string (default: הופעה סטטיק)"
+  "title": "string",
+  "datetime_string": "string (e.g. 'מחר ב-10' or 'ביום שני ב-18:00')" // only for reminders
 }
-"""
 
-        messages = [
-            {"role": "system", "content": system_prompt.strip()},
-            {"role": "user", "content": body.strip()}
-        ]
+### Rules:
 
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=messages
-        )
+- Classify type based on content:
+  - If the message is a **performance** or **rehearsal**, set `"type": "gig"`
+  - If the message describes a **סשן** (session), including סשן בוקר or סשן ערב, set `"type": "session"`
+  - If the message is a personal reminder or task (e.g. 'תזכור', 'אל תשכח', 'לסדר', 'לקנות', 'להתקשר') — set `"type": "reminder"`
+
+- For reminders, only fill:
+  - type = "reminder"
+  - description = short text of the task
+  - datetime_string = if any vague or exact time is mentioned (e.g. 'מחר ב-10', 'ביום ראשון ב-18:00'), translate it into natural English for the Todoist API (e.g. "tomorrow at 10am", "Sunday at 6pm")
+  - All other fields should be empty strings
+
+- For gigs or sessions:
+  - Never guess missing data. If a field is not mentioned, leave it as an empty string.
+  - Do not invent or change the date. Extract it exactly as written (e.g. '16.5.25').
+  - If a time range is mentioned (e.g. 11:00-15:00), use the start time as "time" and calculate the duration as "show_length" (e.g. "4 שעות").
+  - If the message includes:
+      - 'סשן עם <name>'
+      - 'סשן בוקר עם <name>'
+      - 'סשן ערב עם <name>'
+    Then:
+      - Set `"type": "session"`
+      - Use the full phrase before "עם" as the event type (e.g. "סשן ערב")
+      - Append the name after "עם"
+      - Format title as: '<event type> <name>'
+
+  - If message contains phrases like:
+      - 'חזרה עם <name>'
+      - 'הופעה עם <name>'
+    Then:
+      - Set `"type": "gig"`
+      - Same title logic applies
+
+  - If title includes:
+    - 'סשן בוקר' with no time/show_length → set:
+      - "time": "11:00"
+      - "show_length": "4 שעות"
+    - 'סשן ערב' with no time/show_length → set:
+      - "time": "15:00"
+      - "show_length": "4 שעות"
+
+  - If no clear title is found, use default:
+    - For gigs: "הופעה סטטיק"
+    - For sessions: "סשן"
+
+- Do not include any explanation or notes — only return the JSON.
+        """
+
+        messages = [{
+            "role": "system",
+            "content": system_prompt.strip()
+        }, {
+            "role": "user",
+            "content": body.strip()
+        }]
+
+        response = openai.ChatCompletion.create(model="gpt-3.5-turbo",
+                                                messages=messages)
 
         raw_text = response["choices"][0]["message"]["content"]
         print("🧠 GPT raw:", raw_text)
-        parsed = eval(raw_text)  # quick + dirty for now — we'll tighten it later
+        parsed = eval(
+            raw_text)  # quick + dirty for now — we'll tighten it later
         return parsed
 
     except Exception as e:
@@ -206,31 +264,29 @@ def log_to_google_sheets(parsed):
         sys.stdout.flush()
 
 
-# === Webhook ===
+        # === Webhook ===
 @app.route("/", methods=["POST"])
 def handle_whatsapp():
     try:
-        print("🚨 Webhook hit!")
-        sys.stdout.flush()
-
-        print("📥 request.form:", dict(request.form))
-        print("📥 request.get_json():", request.get_json(silent=True))
-        print("📥 request.data:", request.data.decode())
-        sys.stdout.flush()
-
         body = (request.form.get("Body")
                 or (request.get_json(silent=True) or {}).get("Body")
                 or request.data.decode())
 
         print("📩 Raw message:", repr(body))
         parsed = parse_with_gpt(body)
-        print("🧠 Parsed data:", parsed)
-        sys.stdout.flush()
 
-        create_calendar_event(parsed)
-        log_to_google_sheets(parsed)
+        if parsed["type"] == "reminder":
+            from todoist_utils import add_todoist_task
+            task_text = parsed.get("description", "משימה ללא שם")
+            due = parsed.get("datetime_string") or None
+            result = add_todoist_task(task_text, due_string=due)
+            print("✅ Task sent to Todoist:", result)
+
+        # Existing logic like:
+        # create_calendar_event(parsed)
+        # log_to_google_sheets(parsed)
+
         return "OK", 200
-
     except Exception as e:
         print("❌ ERROR:", str(e))
         sys.stdout.flush()
